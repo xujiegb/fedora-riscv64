@@ -12,6 +12,11 @@ on:
         required: true
         default: "fedora-riscv"
         type: string
+      update_series_latest:
+        description: "Whether to also update the Fedora major-series latest tag"
+        required: true
+        default: false
+        type: boolean
       update_global_latest:
         description: "Whether to also update the global latest tag"
         required: true
@@ -183,7 +188,10 @@ jobs:
           global_latest_ref="ghcr.io/${owner}/${image}:latest"
 
           podman tag "$src" "$exact_ref"
-          podman tag "$src" "$series_latest_ref"
+
+          if [[ '${{ inputs.update_series_latest }}' == 'true' ]]; then
+            podman tag "$src" "$series_latest_ref"
+          fi
 
           if [[ '${{ inputs.update_global_latest }}' == 'true' ]]; then
             podman tag "$src" "$global_latest_ref"
@@ -195,7 +203,9 @@ jobs:
 
           echo "Prepared tags:"
           echo "  $exact_ref"
-          echo "  $series_latest_ref"
+          if [[ '${{ inputs.update_series_latest }}' == 'true' ]]; then
+            echo "  $series_latest_ref"
+          fi
           if [[ '${{ inputs.update_global_latest }}' == 'true' ]]; then
             echo "  $global_latest_ref"
           fi
@@ -206,7 +216,10 @@ jobs:
           set -euo pipefail
 
           podman push '${{ steps.tag.outputs.exact_ref }}'
-          podman push '${{ steps.tag.outputs.series_latest_ref }}'
+
+          if [[ '${{ inputs.update_series_latest }}' == 'true' ]]; then
+            podman push '${{ steps.tag.outputs.series_latest_ref }}'
+          fi
 
           if [[ '${{ inputs.update_global_latest }}' == 'true' ]]; then
             podman push '${{ steps.tag.outputs.global_latest_ref }}'
@@ -217,7 +230,9 @@ jobs:
         run: |
           echo "Published:"
           echo "  ${{ steps.tag.outputs.exact_ref }}"
-          echo "  ${{ steps.tag.outputs.series_latest_ref }}"
+          if [[ '${{ inputs.update_series_latest }}' == 'true' ]]; then
+            echo "  ${{ steps.tag.outputs.series_latest_ref }}"
+          fi
           if [[ '${{ inputs.update_global_latest }}' == 'true' ]]; then
             echo "  ${{ steps.tag.outputs.global_latest_ref }}"
           fi
