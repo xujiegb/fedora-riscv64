@@ -1,0 +1,223 @@
+name: Import OCI archive to GHCR
+
+on:
+  workflow_dispatch:
+    inputs:
+      archive_url:
+        description: "OCI archive URL (.tar, .tar.xz, .tar.gz)"
+        required: true
+        type: string
+      image_name:
+        description: "GHCR image name, e.g. fedora-riscv"
+        required: true
+        default: "fedora-riscv"
+        type: string
+      update_global_latest:
+        description: "Whether to also update the global latest tag"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  import-to-ghcr:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y podman jq xz-utils zstd gzip
+
+      - name: Download archive
+        id: dl
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='${{ inputs.archive_url }}'
+          file="${url##*/}"
+
+          echo "archive_url=$url" >> "$GITHUB_OUTPUT"
+          echo "archive_file=$file" >> "$GITHUB_OUTPUT"
+
+          curl -fL --retry 3 --retry-all-errors -o "$file" "$url"
+          ls -lh "$file"
+
+      - name: Parse Fedora version and build version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          file='${{ steps.dl.outputs.archive_file }}'
+          url='${{ steps.dl.outputs.archive_url }}'
+
+          # Try from filename first:
+          # Example:
+          # Fedora-Container-Base-Generic-43-20251027.0.riscv64.oci.tar.xz
+          base="${file##*/}"
+
+          fedora_version=""
+          build_version=""
+
+          if [[ "$base" =~ -([0-9]{2})-([0-9]{8}\.[0-9]+)\. ]]; then
+            fedora_version="${BASH_REMATCH[1]}"
+            build_version="${BASH_REMATCH[2]}"
+          fi
+
+          # Fallback: try from URL path
+          # Example:
+          # /packages/Fedora-Container-Base-Generic/43/20251027.0/images/...
+          if [[ -z "$fedora_version" || -z "$build_version" ]]; then
+            if [[ "$url" =~ /packages/[^/]+/([0-9]{2})/([0-9]{8}\.[0-9]+)/images/ ]]; then
+              fedora_version="${BASH_REMATCH[1]}"
+              build_version="${BASH_REMATCH[2]}"
+            fi
+          fi
+
+          if [[ -z "$fedora_version" || -z "$build_version" ]]; then
+            echo "Failed to parse Fedora version/build version from archive URL or filename." >&2
+            echo "URL: $url" >&2
+            echo "FILE: $base" >&2
+            exit 1
+          fi
+
+          exact_tag="${fedora_version}-${build_version}"
+          series_latest_tag="${fedora_version}-latest"
+
+          echo "fedora_version=$fedora_version" >> "$GITHUB_OUTPUT"
+          echo "build_version=$build_version" >> "$GITHUB_OUTPUT"
+          echo "exact_tag=$exact_tag" >> "$GITHUB_OUTPUT"
+          echo "series_latest_tag=$series_latest_tag" >> "$GITHUB_OUTPUT"
+
+          echo "Parsed Fedora version: $fedora_version"
+          echo "Parsed build version:  $build_version"
+          echo "Exact tag:             $exact_tag"
+          echo "Series latest tag:     $series_latest_tag"
+
+      - name: Decompress if needed
+        id: unpack
+        shell: bash
+        run: |
+          set -euo pipefail
+          f='${{ steps.dl.outputs.archive_file }}'
+          out="$f"
+
+          case "$f" in
+            *.tar.xz)
+              xz -d "$f"
+              out="${f%.xz}"
+              ;;
+            *.tar.gz)
+              gzip -d "$f"
+              out="${f%.gz}"
+              ;;
+            *.tgz)
+              gzip -d "$f"
+              out="${f%.tgz}.tar"
+              ;;
+            *.tar.zst)
+              zstd -d "$f" -o "${f%.zst}"
+              out="${f%.zst}"
+              ;;
+            *.tar.zstd)
+              zstd -d "$f" -o "${f%.zstd}"
+              out="${f%.zstd}"
+              ;;
+            *.tar)
+              ;;
+            *)
+              echo "Unsupported archive extension: $f" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "tar_file=$out" >> "$GITHUB_OUTPUT"
+          ls -lh "$out"
+
+      - name: Load OCI archive into Podman
+        id: load
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar_file='${{ steps.unpack.outputs.tar_file }}'
+
+          load_log="$(mktemp)"
+          podman load -i "$tar_file" | tee "$load_log"
+
+          loaded_ref="$(sed -n 's/^Loaded image(s):[[:space:]]*//p; s/^Loaded image:[[:space:]]*//p' "$load_log" | tail -n1)"
+          rm -f "$load_log"
+
+          if [[ -z "$loaded_ref" ]]; then
+            echo "Could not determine loaded image reference" >&2
+            podman images
+            exit 1
+          fi
+
+          echo "loaded_ref=$loaded_ref" >> "$GITHUB_OUTPUT"
+          echo "Loaded ref: $loaded_ref"
+
+      - name: Login to GHCR
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '${{ secrets.GITHUB_TOKEN }}' | podman login ghcr.io -u '${{ github.actor }}' --password-stdin
+
+      - name: Tag image for GHCR
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          src='${{ steps.load.outputs.loaded_ref }}'
+          owner='${{ github.repository_owner }}'
+          image='${{ inputs.image_name }}'
+
+          exact_ref="ghcr.io/${owner}/${image}:${{ steps.meta.outputs.exact_tag }}"
+          series_latest_ref="ghcr.io/${owner}/${image}:${{ steps.meta.outputs.series_latest_tag }}"
+          global_latest_ref="ghcr.io/${owner}/${image}:latest"
+
+          podman tag "$src" "$exact_ref"
+          podman tag "$src" "$series_latest_ref"
+
+          if [[ '${{ inputs.update_global_latest }}' == 'true' ]]; then
+            podman tag "$src" "$global_latest_ref"
+          fi
+
+          echo "exact_ref=$exact_ref" >> "$GITHUB_OUTPUT"
+          echo "series_latest_ref=$series_latest_ref" >> "$GITHUB_OUTPUT"
+          echo "global_latest_ref=$global_latest_ref" >> "$GITHUB_OUTPUT"
+
+          echo "Prepared tags:"
+          echo "  $exact_ref"
+          echo "  $series_latest_ref"
+          if [[ '${{ inputs.update_global_latest }}' == 'true' ]]; then
+            echo "  $global_latest_ref"
+          fi
+
+      - name: Push image to GHCR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          podman push '${{ steps.tag.outputs.exact_ref }}'
+          podman push '${{ steps.tag.outputs.series_latest_ref }}'
+
+          if [[ '${{ inputs.update_global_latest }}' == 'true' ]]; then
+            podman push '${{ steps.tag.outputs.global_latest_ref }}'
+          fi
+
+      - name: Show result
+        shell: bash
+        run: |
+          echo "Published:"
+          echo "  ${{ steps.tag.outputs.exact_ref }}"
+          echo "  ${{ steps.tag.outputs.series_latest_ref }}"
+          if [[ '${{ inputs.update_global_latest }}' == 'true' ]]; then
+            echo "  ${{ steps.tag.outputs.global_latest_ref }}"
+          fi
